@@ -223,6 +223,7 @@ function ManagerTools() {
   }
   async function addMenuItem(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = event.currentTarget; if (!form.reportValidity()) return;
+    setNotice(''); setError(false);
     const fields = new FormData(form);
     try { const result = await api<{ message: string; product: MenuItem }>('/manager/menu', { method: 'POST', body: JSON.stringify({ name: fields.get('menuName'), category: fields.get('menuCategory'), description: fields.get('menuDescription'), priceCents: Number(fields.get('menuPrice')), isVegetarian: fields.get('menuVegetarian') === 'on', imageUrl: String(fields.get('menuImage') || '') }) }); setMenu((current) => [...current, result.product]); setNotice(result.message); form.reset(); }
     catch (reason) { setNotice(reason instanceof Error ? reason.message : 'Menu item could not be added.'); setError(true); }
@@ -234,6 +235,7 @@ function ManagerTools() {
   }
   async function addTable(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = event.currentTarget; if (!form.reportValidity()) return;
+    setNotice(''); setError(false);
     const fields = new FormData(form);
     try { const result = await api<{ message: string; table: Table }>('/manager/tables', { method: 'POST', body: JSON.stringify({ section: fields.get('section'), seats: Number(fields.get('seats')), row: Number(fields.get('row')), column: Number(fields.get('column')) }) }); setTables((current) => [...current, result.table]); setNotice(result.message); form.reset(); }
     catch (reason) { setNotice(reason instanceof Error ? reason.message : 'Table could not be added.'); setError(true); }
@@ -293,7 +295,7 @@ export function AdminPage() {
     const needle = search.trim().toLowerCase();
     return (dashboard?.reservations || []).filter((reservation) =>
       (statusFilter === 'all' || reservation.status === statusFilter)
-      && (!needle || [reservation.name, reservation.restaurantName, reservation.email, reservation.phone, reservation.tableId, reservation.id, ...(reservation.items || []).map((item) => item.name)].some((value) => value.toLowerCase().includes(needle))),
+      && (!needle || [reservation.name, reservation.restaurantName, reservation.email, reservation.phone, reservation.tableId, reservation.id, ...(reservation.items || []).map((item) => item.name)].some((value) => (value ?? '').toLowerCase().includes(needle))),
     );
   }, [dashboard?.reservations, search, statusFilter]);
 

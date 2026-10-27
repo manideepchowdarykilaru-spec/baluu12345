@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, formatMoney } from './api';
+import { api, ApiError, formatMoney } from './api';
 import { useAuth, useCart } from './context';
 import type { CustomerAddress, DeliveryPaymentConfig, MenuResponse, OrderResponse, PaymentMethod, Product } from './types';
 
@@ -751,8 +751,17 @@ export function CheckoutPage() {
     if (!pendingPayment) return;
     setSending(true); setStatus(pendingPayment.payment?.provider === 'demo' ? 'Completing demo checkout…' : 'Opening secure checkout…'); setStatusError(false);
     try { await finishOnlinePayment(pendingPayment); }
-    catch (reason) { setStatus(reason instanceof Error ? reason.message : 'Payment could not be confirmed.'); setStatusError(true); }
+    catch (reason) {
+      // The order was cancelled or removed, so it can no longer be paid; let the customer check out again.
+      if (reason instanceof ApiError && (reason.status === 404 || reason.status === 409)) abandonPendingPayment();
+      setStatus(reason instanceof Error ? reason.message : 'Payment could not be confirmed.'); setStatusError(true);
+    }
     finally { setSending(false); }
+  }
+
+  function abandonPendingPayment() {
+    saveOrder('juniper-table-pending-payment', null);
+    setPendingPayment(null);
   }
 
   if (receipt) {
@@ -798,7 +807,7 @@ export function CheckoutPage() {
       <Status message={error} error={Boolean(error)} />
       {loading && <p className="quiet-message">Gathering your order…</p>}
       {!loading && !error && lines.length === 0 && !pendingPayment && <div className="empty-state"><p>Your bag is empty. Add something from the menu before checkout.</p><Link className="button button-reserve" to="/menu">Browse the menu</Link></div>}
-      {pendingPayment && <section className="pending-payment-panel"><p className="eyebrow">PAYMENT NOT YET CONFIRMED</p><h2>{pendingPayment.payment?.provider === 'demo' ? 'Complete demo payment' : 'Finish your payment'}</h2><p>Order {pendingPayment.order.id.slice(-8).toUpperCase()} is waiting for online payment. It will not be sent to the kitchen until payment is confirmed.</p>{pendingPayment.payment?.provider === 'demo' && <p className="demo-payment-notice">Demo checkout only. Clicking below records a test payment; no money will be charged.</p>}<Status message={status} error={statusError} /><button className="button button-reserve" type="button" disabled={sending || !paymentConfig?.onlinePaymentsEnabled} onClick={() => void retryPayment()}>{sending ? 'Completing checkout…' : pendingPayment.payment?.provider === 'demo' ? 'Complete demo payment' : 'Retry online payment'}</button>{pendingPayment.payment?.provider !== 'demo' && <p className="fine-print">If you completed payment but returned here, check your bank status before trying again.</p>}</section>}
+      {pendingPayment && <section className="pending-payment-panel"><p className="eyebrow">PAYMENT NOT YET CONFIRMED</p><h2>{pendingPayment.payment?.provider === 'demo' ? 'Complete demo payment' : 'Finish your payment'}</h2><p>Order {pendingPayment.order.id.slice(-8).toUpperCase()} is waiting for online payment. It will not be sent to the kitchen until payment is confirmed.</p>{pendingPayment.payment?.provider === 'demo' && <p className="demo-payment-notice">Demo checkout only. Clicking below records a test payment; no money will be charged.</p>}<Status message={status} error={statusError} /><button className="button button-reserve" type="button" disabled={sending || !paymentConfig?.onlinePaymentsEnabled} onClick={() => void retryPayment()}>{sending ? 'Completing checkout…' : pendingPayment.payment?.provider === 'demo' ? 'Complete demo payment' : 'Retry online payment'}</button> <button className="button button-outline-dark" type="button" disabled={sending} onClick={abandonPendingPayment}>Start a new order</button>{pendingPayment.payment?.provider !== 'demo' && <p className="fine-print">If you completed payment but returned here, check your bank status before trying again.</p>}</section>}
       {!loading && !error && lines.length > 0 && !pendingPayment && <>
         <section className="order-summary"><h2>In your bag</h2><ul>{lines.map(({ product, quantity }) => <li key={product.id}><span>{product.name} × {quantity}</span><strong>{formatMoney(product.priceCents * quantity)}</strong></li>)}</ul>
           <p><span>Subtotal</span><strong>{formatMoney(subtotal)}</strong></p><p><span>Estimated tax (8%)</span><strong>{formatMoney(tax)}</strong></p>{deliveryFee > 0 && <p><span>Delivery charge</span><strong>{formatMoney(deliveryFee)}</strong></p>}<p className="summary-total"><span>Estimated total</span><strong>{formatMoney(subtotal + tax + deliveryFee)}</strong></p><p className="fine-print">The server calculates the final amount from current menu prices. No delivery charge has been configured unless one appears above.</p>

@@ -135,7 +135,7 @@ app.use(
       'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
       'font-src': ["'self'", 'https://fonts.gstatic.com', 'data:'],
       'script-src': ["'self'", 'https://checkout.razorpay.com'],
-      'connect-src': ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+      'connect-src': ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com', 'https://lumberjack.razorpay.com'],
       'frame-src': ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
       'img-src': ["'self'", 'data:', 'https://*.razorpay.com'],
     },
@@ -170,6 +170,11 @@ app.post('/api/payments/webhook', express.raw({ type: 'application/json', limit:
   const order = await Order.findOne({ razorpayOrderId: payment.order_id });
   if (!order) return response.status(404).json({ error: 'The linked order could not be found.' });
   if (payment.amount !== order.totalCents || payment.currency !== order.currency) return response.status(409).json({ error: 'Payment amount or currency does not match the order.' });
+  if (order.paymentStatus === 'refund_pending' && !order.razorpayPaymentId) {
+    // The status poll flagged the refund without the payment ID; record it here.
+    await Order.updateOne({ _id: order._id, paymentStatus: 'refund_pending', razorpayPaymentId: { $in: [null, ''] } }, { $set: { razorpayPaymentId: payment.id } });
+    return response.json({ received: true, alreadyProcessed: true });
+  }
   if (order.paymentStatus === 'paid' || (order.paymentStatus === 'refund_pending' && order.razorpayPaymentId === payment.id)) return response.json({ received: true, alreadyProcessed: true });
   if (order.status === 'cancelled' && order.paymentStatus === 'pending') {
     await Order.updateOne({ _id: order._id, paymentStatus: 'pending', status: 'cancelled' }, { $set: { paymentStatus: 'refund_pending', razorpayPaymentId: payment.id } });
@@ -1076,25 +1081,35 @@ api.post('/orders/:id/verify-payment', formLimiter, async (request, response) =>
     return response.status(409).json({ error: 'Payment has not been captured yet. The order is still awaiting payment confirmation.' });
   }
 
-  if (order.status === 'cancelled') {
-    order.paymentStatus = 'refund_pending';
-    order.razorpayPaymentId = payment.id;
-    await order.save();
-    await safelyNotify(notifyRefundPending(order));
-    return response.json({ message: 'Payment was captured after cancellation. A refund is pending manual processing by the restaurant.', order: { id: String(order._id), status: order.status, paymentStatus: order.paymentStatus, totalCents: order.totalCents } });
+  // Conditional writes so a webhook, status poll, cancellation, or staff update made during the gateway calls is not overwritten.
+  const refundPendingOrder = await Order.findOneAndUpdate(
+    { _id: order._id, status: 'cancelled', paymentStatus: 'pending' },
+    { $set: { paymentStatus: 'refund_pending', razorpayPaymentId: payment.id } },
+    { new: true },
+  );
+  if (refundPendingOrder) await safelyNotify(notifyRefundPending(refundPendingOrder));
+  const placedOrder = refundPendingOrder ? null : await Order.findOneAndUpdate(
+    { _id: order._id, status: 'awaiting_payment', paymentStatus: 'pending' },
+    { $set: { paymentStatus: 'paid', status: 'pending', razorpayPaymentId: payment.id }, $push: { statusHistory: { status: 'pending', changedAt: new Date() } } },
+    { new: true },
+  );
+  if (placedOrder) await safelyNotify(notifyOrderPlaced(placedOrder));
+  if (!refundPendingOrder && !placedOrder) {
+    await Order.updateOne({ _id: order._id, paymentStatus: 'pending', status: { $nin: ['awaiting_payment', 'cancelled'] } }, { $set: { paymentStatus: 'paid', razorpayPaymentId: payment.id } });
   }
 
-  order.paymentStatus = 'paid';
-  order.razorpayPaymentId = payment.id;
-  if (order.status === 'awaiting_payment') {
-    order.status = 'pending';
-    order.statusHistory.push({ status: 'pending', changedAt: new Date() });
+  const current = await Order.findById(order._id).select('status paymentStatus totalCents').lean();
+  if (!current) return response.status(404).json({ error: 'The online order could not be found.' });
+  const summary = { id: String(current._id), status: current.status, paymentStatus: current.paymentStatus, totalCents: current.totalCents };
+  if (current.paymentStatus === 'refund_pending') {
+    return response.json({ message: 'Payment was captured after cancellation. A refund is pending manual processing by the restaurant.', order: summary });
   }
-  await order.save();
-  if (order.status === 'pending') await safelyNotify(notifyOrderPlaced(order));
+  if (current.paymentStatus !== 'paid') {
+    return response.status(409).json({ error: 'The order is no longer awaiting payment.' });
+  }
   return response.json({
     message: 'Payment confirmed. Your delivery order has been sent to the restaurant.',
-    order: { id: String(order._id), status: order.status, paymentStatus: order.paymentStatus, totalCents: order.totalCents },
+    order: summary,
   });
 });
 
@@ -1110,13 +1125,25 @@ api.get('/orders/:id/status', orderStatusLimiter, async (request, response) => {
     try {
       const gatewayOrder = await razorpayRequest<RazorpayGatewayOrder>(`/orders/${encodeURIComponent(order.razorpayOrderId)}`, 'GET');
       if (gatewayOrder.status === 'paid' && gatewayOrder.amount_paid === order.totalCents && gatewayOrder.currency === (order.currency || 'INR')) {
-        const nextStatus = status === 'awaiting_payment' ? 'pending' : status;
-        await Order.updateOne({ _id: order._id, paymentStatus: 'pending' }, {
-          $set: { paymentStatus: 'paid', status: nextStatus },
-          ...(nextStatus !== status ? { $push: { statusHistory: { status: nextStatus, changedAt: new Date() } } } : {}),
-        });
-        status = status === 'awaiting_payment' ? 'pending' : status;
-        paymentStatus = 'paid';
+        // Match the status read above so a cancellation made meanwhile is not undone.
+        if (status === 'cancelled') {
+          const result = await Order.updateOne({ _id: order._id, paymentStatus: 'pending', status: 'cancelled' }, { $set: { paymentStatus: 'refund_pending' } });
+          if (result.modifiedCount) {
+            paymentStatus = 'refund_pending';
+            await safelyNotify(notifyRefundPending(order));
+          }
+        } else {
+          const nextStatus = status === 'awaiting_payment' ? 'pending' : status;
+          const result = await Order.updateOne({ _id: order._id, paymentStatus: 'pending', status }, {
+            $set: { paymentStatus: 'paid', status: nextStatus },
+            ...(nextStatus !== status ? { $push: { statusHistory: { status: nextStatus, changedAt: new Date() } } } : {}),
+          });
+          if (result.modifiedCount) {
+            if (nextStatus !== status) await safelyNotify(notifyOrderPlaced(order));
+            status = nextStatus;
+            paymentStatus = 'paid';
+          }
+        }
       }
     } catch { /* The status page can retry if the gateway is temporarily unavailable. */ }
   }
@@ -1198,10 +1225,10 @@ api.get('/manager/dashboard', requireManager, async (request, response) => {
     Order.aggregate([{ $match: { restaurantId, paymentStatus: 'paid' } }, { $group: { _id: null, total: { $sum: '$totalCents' } } }]),
   ]);
   return response.json({
-    restaurant: { id: restaurantId, name: 'Foodie Table' },
+    restaurant: { id: restaurantId, name: restaurantNameFor(restaurantId) },
     stats: { orderCount, pendingOrderCount, reservationCount, pendingReservationCount, verifiedSalesCents: paidOrders[0]?.total || 0 },
     orders: orders.map((order) => ({ id: String(order._id), customerName: order.customerName, email: order.email, phone: order.phone, address: order.address, deliveryInstructions: order.deliveryInstructions || '', paymentMethod: order.paymentMethod, paymentStatus: order.paymentStatus || 'unpaid', items: order.items || [], subtotalCents: order.subtotalCents, taxCents: order.taxCents, deliveryFeeCents: order.deliveryFeeCents || 0, totalCents: order.totalCents, currency: order.currency || 'INR', status: order.status || 'pending', createdAt: order.createdAt })),
-    reservations: reservations.map((reservation) => ({ id: String(reservation._id), name: reservation.name, email: reservation.email, phone: reservation.phone, date: reservation.date, time: reservation.time, guests: reservation.guests, tableId: reservation.tableId || 'Table not assigned', currency: reservation.currency || 'INR', items: reservation.items || [], preorderTotalCents: reservation.preorderTotalCents || 0, status: reservation.status || 'pending', specialRequests: reservation.specialRequests || '', createdAt: reservation.createdAt })),
+    reservations: reservations.map((reservation) => ({ id: String(reservation._id), name: reservation.name, restaurantName: restaurantNameFor(restaurantId), email: reservation.email, phone: reservation.phone, date: reservation.date, time: reservation.time, guests: reservation.guests, tableId: reservation.tableId || 'Table not assigned', currency: reservation.currency || 'INR', items: reservation.items || [], preorderTotalCents: reservation.preorderTotalCents || 0, status: reservation.status || 'pending', specialRequests: reservation.specialRequests || '', createdAt: reservation.createdAt })),
   });
 });
 
@@ -1223,7 +1250,8 @@ api.post('/manager/menu', requireManager, async (request, response) => {
   const baseId = input.name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'menu-item';
   let id = baseId;
   let suffix = 2;
-  while (await Product.exists({ restaurantId: manager.restaurantId, id })) id = `${baseId}-${suffix++}`;
+  // Product IDs are unique across all restaurants, not only this one.
+  while (await Product.exists({ id })) id = `${baseId}-${suffix++}`;
   const nextOrder = await Product.countDocuments({ restaurantId: manager.restaurantId });
   const product = await Product.create({ ...input, id, restaurantId: manager.restaurantId, displayOrder: nextOrder + 1, emoji: input.isVegetarian ? '🥬' : '🍽️', active: true });
   await recordStaffAction(request, 'manager', 'menu_item_created', 'menu_item', product.id, manager.restaurantId, { category: product.category, isVegetarian: product.isVegetarian });
@@ -1266,8 +1294,11 @@ api.post('/manager/tables', requireManager, async (request, response) => {
   if (!manager?.restaurantId) return response.status(403).json({ error: 'This manager account is not assigned to a restaurant.' });
   const input = z.object({ section: z.enum(['A', 'B', 'C']), seats: z.coerce.number().int().min(1).max(8), row: z.coerce.number().int().min(1).max(2), column: z.coerce.number().int().min(1).max(2) }).parse(request.body);
   const existingIds = await DiningTable.find({ restaurantId: manager.restaurantId }).select('id').lean();
-  const nextNumber = existingIds.reduce((max, table) => Math.max(max, Number(table.id.replace(/^T/i, '')) || 0), 0) + 1;
-  const table = await DiningTable.create({ id: `T${String(nextNumber).padStart(2, '0')}`, ...input, restaurantId: manager.restaurantId, active: true });
+  // Table IDs are unique across all restaurants, so use the same per-restaurant prefix as the seeded tables.
+  const restaurantIndex = RESTAURANTS.findIndex((restaurant) => restaurant.id === manager.restaurantId);
+  const idPrefix = restaurantIndex > 0 ? `V${String(restaurantIndex + 1).padStart(2, '0')}-T` : 'T';
+  const nextNumber = existingIds.reduce((max, table) => table.id.startsWith(idPrefix) ? Math.max(max, Number(table.id.slice(idPrefix.length)) || 0) : max, 0) + 1;
+  const table = await DiningTable.create({ id: `${idPrefix}${String(nextNumber).padStart(2, '0')}`, ...input, restaurantId: manager.restaurantId, active: true });
   await recordStaffAction(request, 'manager', 'table_created', 'table', table.id, manager.restaurantId, { seats: table.seats, section: table.section });
   return response.status(201).json({ message: 'Table added.', table: table.toObject() });
 });
@@ -1696,7 +1727,10 @@ async function start(): Promise<void> {
       if ('keyPattern' in error && error.keyPattern && typeof error.keyPattern === 'object' && 'tableId' in error.keyPattern) {
         return response.status(409).json({ error: 'That table was just requested for this time. Choose another table or time.' });
       }
-      return response.status(409).json({ error: 'An account with this email already exists.' });
+      if ('keyPattern' in error && error.keyPattern && typeof error.keyPattern === 'object' && 'email' in error.keyPattern) {
+        return response.status(409).json({ error: 'An account with this email already exists.' });
+      }
+      return response.status(409).json({ error: 'That item already exists. Use a different name or ID and try again.' });
     }
     console.error('Request failed:', error instanceof Error ? error.message : 'Unknown server error');
     return response.status(500).json({ error: 'The request could not be completed.' });

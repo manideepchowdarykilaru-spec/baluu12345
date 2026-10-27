@@ -92,7 +92,7 @@ const orderSchema = new Schema(
     subtotalCents: { type: Number, required: true, min: 0 },
     taxCents: { type: Number, required: true, min: 0 },
     totalCents: { type: Number, required: true, min: 0 },
-    status: { type: String, required: true, enum: ['awaiting_payment', 'pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'completed', 'cancelled'], default: 'pending', index: true },
+    status: { type: String, required: true, enum: ['awaiting_payment', 'pending', 'confirmed', 'rejected', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'completed', 'cancelled'], default: 'pending', index: true },
     statusHistory: { type: [orderStatusHistorySchema], default: [] },
     userId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     restaurantId: { type: String, required: true, default: 'juniper-table', index: true },

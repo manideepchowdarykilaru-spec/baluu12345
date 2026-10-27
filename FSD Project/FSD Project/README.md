@@ -50,25 +50,7 @@ The local MongoDB database stores files in the operating system temporary direct
 
 ## Public demo deployment
 
-The repository root includes `render.yaml` for a Render web service. Connect this repository to Render as a Blueprint, then provide a hosted MongoDB URI and administrator username, email, and password when prompted. Render generates the session secret. The app uses the Render service URL for same-origin API requests and serves the built client and API from one service.
-
-### Deploy the frontend and API as separate Vercel services
-
-The repository-root `vercel.json` builds the Vite client and Express API as separate Vercel services. Vercel routes `/api/*` to Express and all other paths to the client, so both services share one deployment URL and the existing session cookie remains same-origin.
-
-1. Import this repository into Vercel and leave the project Root Directory at the repository root. The `vercel.json` there points to `FSD Project/FSD Project/client` and `FSD Project/FSD Project/server`.
-2. Set the project's Framework Preset to **Services**. Vercel Services are currently in beta and require access for the team.
-3. Add these runtime environment variables to the Vercel project:
-   - `NODE_ENV=production`.
-   - `MONGODB_URI`: a hosted MongoDB connection string.
-   - `SESSION_SECRET`: a random value with at least 32 characters.
-   - `ADMIN_USERNAME`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD`: set all three to enable the admin desk.
-   - `PAYMENT_CURRENCY=INR` and `DELIVERY_FEE_CENTS=0`.
-   - Optional Razorpay credentials: `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET`.
-4. Enable **Automatically expose System Environment Variables** so the API can allow the deployment, preview, and production Vercel origins. Add any custom frontend domain to `CLIENT_ORIGIN` as a comma-separated origin list.
-5. Deploy. The frontend URL serves the app, and its `/api` routes go to the Express service.
-
-Vercel Services keep these as independently built services in one deployment. If you need two separate Vercel projects with different domains, the app will also need cross-origin session-cookie configuration; that is a different setup from the same-origin deployment described here.
+The repository root includes `render.yaml` for a Render web service. Connect this repository to Render as a Blueprint, then provide a hosted MongoDB URI and administrator username, email, and password when prompted. Render generates the session secret. In MongoDB Atlas, allow access from `0.0.0.0/0` under Network Access, because Render's free plan does not use fixed IP addresses. The app uses the Render service URL for same-origin API requests and serves the built client and API from one service.
 
 The local temporary MongoDB database is not suitable for hosting. Use a hosted MongoDB database for persistent accounts, orders, and reservations. Render's free web services can spin down while idle, so the first request after inactivity may take longer.
 
